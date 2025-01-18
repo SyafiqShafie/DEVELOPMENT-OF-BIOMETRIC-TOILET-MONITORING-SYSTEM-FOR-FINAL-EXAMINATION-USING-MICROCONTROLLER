@@ -1,0 +1,628 @@
+#include <Adafruit_Fingerprint.h> 
+#include <HardwareSerial.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <LiquidCrystal_I2C.h>
+#include <vector> // To use std::vector for tracking logged-in users
+#include <WiFiUdp.h>
+#include <NTPClient.h>
+#include <WebServer.h> // For handling HTTP requests
+
+// Wi-Fi credentials
+const char* ssid = "Galaxy";
+const char* password = "1234567890";
+
+// Server URLs
+const char* matrixURL = "http://192.168.73.157/get_matrix.php";
+const char* serverURL = "http://192.168.73.157/register.php";
+const char* getIDURL = "http://192.168.73.157/get_next_id.php";
+const char* loginLogoutURL = "http://192.168.73.157/login_logout.php"; // New URL for login/logout requests
+
+// Use Hardware Serial on ESP32
+HardwareSerial mySerial(1);
+Adafruit_Fingerprint finger = Adafruit_Fingerprint(&mySerial);
+
+// OLED Display (128x64 resolution)
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+Adafruit_SSD1306 oled(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+// LCD Display (16x2)
+LiquidCrystal_I2C lcd(0x27, 16, 2); // Adjust I2C address if needed
+
+// Track login count and logged-in users
+int loginCount = 0;
+std::vector<int> loggedInUsers;
+
+// Button pin definition
+const int buttonPin = 14;  // Pin connected to the push button
+bool buttonState = false;   // To store the button state
+bool lastButtonState = false; // For debouncing
+bool messageDisplayed = false;
+
+// Time variables
+WiFiUDP udp;
+NTPClient timeClient(udp, "pool.ntp.org", 0, 3600000); // Time offset in seconds (0 for GMT)
+
+// WebServer to handle HTTP requests
+WebServer server(80);
+
+// Function prototypes
+void handleRoot();
+void handleRegister();
+void sendDataToServer(int userID, String nickname, String matrixNum, String fullName);
+bool scanFingerprint(int &fingerID);
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("Fingerprint login and registration system");
+
+  // Initialize OLED
+  if (!oled.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("OLED initialization failed!");
+    while (true);
+  }
+
+  // Show "FINAL YEAR PROJECT" on the OLED
+  oled.clearDisplay();
+  oled.setTextColor(SSD1306_WHITE);
+  oled.setCursor(0, 10); // Position the text
+  oled.setTextSize(1); // Default text size
+  oled.println("FINAL YEAR PROJECT");
+  oled.display();
+  delay(2000); // Display for 2 seconds
+
+  // Connect to Wi-Fi
+  oled.clearDisplay();
+  oled.setCursor(0, 10);
+  oled.println("Connecting to Wi-Fi...");
+  oled.display();
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to Wi-Fi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(1000);
+    Serial.print(".");
+  }
+  Serial.println("\nConnected to Wi-Fi!");
+  oled.clearDisplay();
+  oled.setCursor(0, 10);
+  oled.println("Wi-Fi Connected!");
+  oled.display();
+  delay(1000); // Pause for 1 second
+
+  // Initialize the fingerprint sensor connection
+  mySerial.begin(57600, SERIAL_8N1, 16, 17); // RX = 16, TX = 17
+  finger.begin(57600);
+
+  oled.clearDisplay();
+  oled.setCursor(0, 10);
+  oled.println("Detecting Fingerprint...");
+  oled.display();
+
+  if (finger.verifyPassword()) {
+    Serial.println("Fingerprint sensor detected!");
+    oled.clearDisplay();
+    oled.setCursor(0, 10);
+    oled.println("Fingerprint Detected!");
+    oled.display();
+    delay(1000); // Pause for 1 second
+  } else {
+    Serial.println("Fingerprint sensor not detected :(");
+    oled.clearDisplay();
+    oled.setCursor(0, 10);
+    oled.println("Fingerprint Sensor\nNot Detected!");
+    oled.display();
+    while (true);
+  }
+
+  // Initialize the NTP client
+  timeClient.begin();
+  timeClient.setTimeOffset(8 * 3600); // Malaysia Time (UTC+8)
+
+  // Initialize LCD with "Initializing..." message
+  lcd.init();
+  lcd.backlight();
+  lcd.setCursor(0, 0);
+  lcd.print("Initializing...");
+  delay(2000); // Display "Initializing..." for 2 seconds
+
+  // Display default LCD message
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Login Count: 0");
+
+  // Initialize button pin
+  pinMode(buttonPin, INPUT_PULLUP);  // Button with internal pull-up resistor
+
+  // Display the default OLED message
+  oled.clearDisplay();
+  oled.setCursor(0, 0);
+  oled.println("Press button to Login");
+  oled.display();
+  server.on("/delete_fingerprint", HTTP_POST, []() {
+        // Get the fingerprint ID from the request
+        if (server.hasArg("id")) {
+            int fingerID = server.arg("id").toInt();
+
+            // Delete the fingerprint from the sensor
+            if (finger.deleteModel(fingerID) == FINGERPRINT_OK) {
+                server.send(200, "application/json", "{\"status\":\"success\",\"message\":\"Fingerprint deleted successfully!\"}");
+            } else {
+                server.send(400, "application/json", "{\"status\":\"error\",\"message\":\"Failed to delete fingerprint.\"}");
+            }
+        } else {
+            server.send(400, "application/json", "{\"status\":\"error\",\"message\":\"Missing fingerprint ID.\"}");
+        }
+    });
+  // Set up the web server
+  server.on("/", handleRoot);
+  server.on("/register", handleRegister);
+  server.begin();
+  Serial.println("HTTP server started");
+}
+
+void loop() {
+  server.handleClient(); // Handle incoming HTTP requests
+
+  if (!messageDisplayed) {
+    String message = "Press button to Login";
+    Serial.println(message);
+    displayOnOLED(message);
+    messageDisplayed = true; // Set the flag so the message is displayed only once
+  }
+
+  // Check the button state for login
+  buttonState = digitalRead(buttonPin) == HIGH; // Button pressed for login
+
+  if (buttonState && !lastButtonState) {
+    // Button has just been pressed for login
+    loginFingerprint();
+    messageDisplayed = false; // Reset the flag to allow showing the message again
+  } else if (!buttonState && lastButtonState) {
+    String buttonReleaseMessage = "Button released, waiting...";
+    Serial.println(buttonReleaseMessage);
+  }
+
+  lastButtonState = buttonState; // Update the last button state
+
+  // Display time and date on OLED
+  displayTimeAndDate();
+
+  delay(50); // Small delay for debounce handling
+}
+
+// Handle the root URL
+void handleRoot() {
+  String message = "ESP32 Fingerprint Registration System\n";
+  message += "Use /register to trigger fingerprint scanning and registration.";
+  server.send(200, "text/plain", message);
+}
+
+// Handle the /register URL
+void handleRegister() {
+  Serial.println("Register request received");
+
+  // Add CORS headers
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.sendHeader("Access-Control-Allow-Methods", "POST, GET");
+  server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
+
+  if (server.method() != HTTP_POST) {
+    server.send(405, "application/json", "{\"status\":\"error\",\"message\":\"Method Not Allowed\"}");
+    return;
+  }
+
+  // Get the POST data
+  String nickname = server.arg("nickname");
+  String matrixNum = server.arg("matrix_num");
+  String fullName = server.arg("fullname");
+
+  // Debug logs
+  Serial.println("Nickname: " + nickname);
+  Serial.println("Matrix Number: " + matrixNum);
+  Serial.println("Full Name: " + fullName);
+
+  if (nickname == "" || matrixNum == "" || fullName == "") {
+    server.send(400, "application/json", "{\"status\":\"error\",\"message\":\"Missing user details (nickname, matrix_num, fullname).\"}");
+    return;
+  }
+
+  // Fetch the next available user ID from the server
+  int userID = getNextUserID();
+  if (userID <= 0) {
+    server.send(400, "application/json", "{\"status\":\"error\",\"message\":\"Failed to fetch next user ID.\"}");
+    return;
+  }
+
+  // Scan fingerprint and store it with the fetched user ID
+  int fingerID = userID; // Set fingerID to the fetched user ID
+  if (scanFingerprint(fingerID)) {
+    Serial.println("Fingerprint scanned successfully. ID: " + String(fingerID));
+
+    // Send fingerprint data and user details to the server
+    sendDataToServer(fingerID, nickname, matrixNum, fullName);
+
+    // Send success response
+    server.send(200, "application/json", "{\"status\":\"success\",\"message\":\"Fingerprint registered successfully!\"}");
+  } else {
+    // Send error response
+    server.send(400, "application/json", "{\"status\":\"error\",\"message\":\"Fingerprint scanning failed.\"}");
+  }
+}
+
+// Function to scan fingerprint
+bool scanFingerprint(int &fingerID) {
+  Serial.println("Place your finger on the sensor...");
+  displayOnOLED("Place your finger\non the sensor...");
+  while (finger.getImage() != FINGERPRINT_OK) {
+    delay(200);
+  }
+  Serial.println("Fingerprint detected! Converting...");
+  displayOnOLED("Fingerprint detected!\nConverting...");
+  if (finger.image2Tz(1) != FINGERPRINT_OK) {
+    Serial.println("Failed to convert fingerprint image.");
+    displayOnOLED("Failed to convert\nfingerprint image.");
+    return false;
+  }
+
+  Serial.println("Do not remove your   finger.");
+  displayOnOLED("Do not remove your   finger.");
+  delay(2000);
+  Serial.println("Place the same finger again...");
+  displayOnOLED("Place the same finger\nagain...");
+  while (finger.getImage() != FINGERPRINT_OK) {
+    delay(200);
+  }
+  Serial.println("Fingerprint detected again! Converting...");
+  displayOnOLED("Fingerprint detected\nagain! Converting...");
+  if (finger.image2Tz(2) != FINGERPRINT_OK) {
+    Serial.println("Failed to convert fingerprint image.");
+    displayOnOLED("Failed to convert\nfingerprint image.");
+    return false;
+  }
+
+  Serial.println("Creating fingerprint model...");
+  displayOnOLED("Press button to Login");
+  if (finger.createModel() != FINGERPRINT_OK) {
+    Serial.println("Failed to create fingerprint model.");
+    displayOnOLED("Failed to create\nfingerprint model.");
+    return false;
+  }
+
+  // Store the fingerprint with the provided fingerID
+  if (finger.storeModel(fingerID) != FINGERPRINT_OK) {
+    Serial.println("Failed to store fingerprint.");
+    displayOnOLED("Failed to store\nfingerprint.");
+    return false;
+  }
+
+  return true;
+}
+
+// Function to send data to the server
+void sendDataToServer(int userID, String nickname, String matrixNum, String fullName) {
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+    http.begin(serverURL);
+    http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+
+    // Prepare POST data
+    String postData = "id=" + String(userID) + "&nickname=" + nickname + "&matrix_num=" + matrixNum + "&fullname=" + fullName;
+    int httpResponseCode = http.POST(postData);
+
+    if (httpResponseCode > 0) {
+      String response = http.getString();
+      Serial.println("Server Response: " + response);
+    } else {
+      Serial.println("Error sending POST request: " + String(httpResponseCode));
+    }
+
+    http.end();
+  } else {
+    Serial.println("Wi-Fi not connected. Unable to send data to server.");
+  }
+}
+
+void displayOnOLED(String message) {
+  oled.clearDisplay();
+  oled.setCursor(0, 0);
+
+  // Split the message into lines for better display
+  int lineHeight = 10;
+  int line = 0;
+
+  while (message.length() > 0) {
+    int nextLineEnd = message.indexOf('\n');
+    if (nextLineEnd == -1) nextLineEnd = message.length();
+
+    String lineText = message.substring(0, nextLineEnd);
+    oled.setCursor(0, line * lineHeight);
+    oled.println(lineText);
+
+    message = message.substring(nextLineEnd + 1);
+    line++;
+  }
+
+  oled.display();
+}
+
+void displayTimeAndDate() {
+  timeClient.update(); // Update time from NTP server
+
+  // Get the current Unix timestamp
+  unsigned long epochTime = timeClient.getEpochTime();
+  
+  // Convert the Unix timestamp to date and time
+  String formattedTime = formatTime(epochTime);
+  String currentDate = formatDate(epochTime);
+
+  // Clear only the bottom part of the display (specific to where the date and time are shown)
+  oled.fillRect(0, 40, SCREEN_WIDTH, 24, SSD1306_BLACK); // Clear the bottom 24 pixels
+  oled.setCursor(0, 40);  // Adjust cursor to the bottom of the screen
+  oled.println("Date: " + currentDate);
+  oled.setCursor(0, 50);  // Move cursor slightly lower for time
+  oled.println("Time: " + formattedTime);
+  oled.display();
+}
+
+String formatDate(unsigned long epochTime) {
+  // Use the NTPClient to get the adjusted time for Malaysia Time (UTC+8)
+  timeClient.setTimeOffset(8 * 3600); // Set the timezone offset to UTC+8
+  timeClient.update(); // Update the time from the NTP server
+
+  // Get the adjusted epoch time
+  unsigned long adjustedEpochTime = timeClient.getEpochTime();
+
+  // Calculate the current date
+  int daysSinceEpoch = adjustedEpochTime / 86400; // Days since 1 Jan 1970
+  int year = 1970;
+
+  // Calculate the current year
+  while (true) {
+    int daysInYear = (year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)) ? 366 : 365;
+    if (daysSinceEpoch >= daysInYear) {
+      daysSinceEpoch -= daysInYear;
+      year++;
+    } else {
+      break;
+    }
+  }
+
+  // Days in each month (adjusted for leap year)
+  int month_lengths[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+  if (year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)) {
+    month_lengths[1] = 29; // Adjust February for leap year
+  }
+
+  // Calculate the current month and day
+  int month = 0;
+  while (daysSinceEpoch >= month_lengths[month]) {
+    daysSinceEpoch -= month_lengths[month];
+    month++;
+  }
+  month++; // Months are 1-indexed
+  int day = daysSinceEpoch + 1; // Days are 1-indexed
+
+  // Format the date as "DD/MM/YYYY"
+  return String(day) + "/" + String(month) + "/" + String(year);
+}
+
+String formatTime(unsigned long epochTime) {
+  int hours = (epochTime % 86400) / 3600;  // Calculate hours
+  int minutes = (epochTime % 3600) / 60;   // Calculate minutes
+  int seconds = epochTime % 60;            // Calculate seconds
+
+  // Format hours, minutes, and seconds to ensure two digits
+  String formattedTime = String(hours);
+  if (hours < 10) formattedTime = "0" + formattedTime;  // Ensure 2-digit hours
+
+  formattedTime += ":";
+  formattedTime += String(minutes);
+  if (minutes < 10) formattedTime = formattedTime.substring(0, formattedTime.length() - 2) + "0" + String(minutes);  // Ensure 2-digit minutes
+
+  formattedTime += ":";
+  formattedTime += String(seconds);
+  if (seconds < 10) formattedTime = formattedTime.substring(0, formattedTime.length() - 2) + "0" + String(seconds);  // Ensure 2-digit seconds
+
+  return formattedTime;
+}
+
+
+void loginFingerprint() {
+  if (loginCount >= 10) {
+    // Display "FULL PLEASE WAIT" on the bottom of the LCD
+    lcd.setCursor(0, 1); // Move to the second line of the LCD
+    lcd.print("FULL PLEASE WAIT");
+    Serial.println("Login full. Please wait.");
+    displayOnOLED("Login full.\nPlease wait.");
+  } else {
+    // Clear the second line of the LCD
+    lcd.setCursor(0, 1);
+    lcd.print("                "); // Clear the line
+  }
+
+  Serial.println("Place your finger on the sensor...");
+  displayOnOLED("Waiting for finger\nto login...");
+
+  unsigned long startTime = millis();
+  unsigned long fingerprintStartTime = millis(); // Start time for fingerprint scanning
+
+  while (millis() - startTime < 5000) { // Wait for up to 5 seconds
+    if (finger.getImage() == FINGERPRINT_OK) {
+      unsigned long fingerprintEndTime = millis(); // End time for fingerprint scanning
+      Serial.println("Fingerprint detected! Converting...");
+      displayOnOLED("Fingerprint detected!\nConverting...");
+
+      if (finger.image2Tz(1) != FINGERPRINT_OK) {
+        String error = "Failed to convert the fingerprint.";
+        delay(2000);
+        Serial.println(error);
+        displayOnOLED(error);
+        delay(2000);
+        return;
+      }
+
+      if (finger.fingerFastSearch() == FINGERPRINT_OK) {
+        int fingerID = finger.fingerID;
+        Serial.print("Fingerprint matched with ID: ");
+        Serial.println(fingerID);
+
+        auto it = std::find(loggedInUsers.begin(), loggedInUsers.end(), fingerID);
+        if (it != loggedInUsers.end()) {
+          // Logout the user
+          loginCount--;
+          loggedInUsers.erase(it);
+          Serial.println("Logout successful!");
+
+          // Send logout request to PHP
+          unsigned long serverStartTime = millis(); // Start time for server request
+          sendLoginLogoutRequest(fingerID, "logout");
+          unsigned long serverEndTime = millis(); // End time for server request
+          Serial.println("Server response time: " + String(serverEndTime - serverStartTime) + " ms");
+
+          String matrixNum = getMatrixNumberByID(fingerID);
+          if (matrixNum != "") {
+            displayOnOLED("Goodbye!\nID: " + String(fingerID) + "\nMatrix No: " + matrixNum);
+          } else {
+            displayOnOLED("Goodbye!\nID: " + String(fingerID));
+          }
+          delay(3000);  // Add 3 seconds delay
+        } else {
+          // Login the user
+          if (loginCount < 10) { // Only allow login if loginCount is less than 10
+            loginCount++;
+            loggedInUsers.push_back(fingerID);
+            Serial.println("Login successful!");
+
+            // Send login request to PHP
+            unsigned long serverStartTime = millis(); // Start time for server request
+            sendLoginLogoutRequest(fingerID, "login");
+            unsigned long serverEndTime = millis(); // End time for server request
+            Serial.println("Server response time: " + String(serverEndTime - serverStartTime) + " ms");
+
+            String matrixNum = getMatrixNumberByID(fingerID);
+            if (matrixNum != "") {
+              displayOnOLED("Welcome!\nID: " + String(fingerID) + "\nMatrix No: " + matrixNum);
+            } else {
+              displayOnOLED("Welcome!\nID: " + String(fingerID));
+            }
+            delay(3000);  // Add 3 seconds delay
+          } else {
+            String error = "Login full. Please wait.";
+            Serial.println(error);
+            displayOnOLED(error);
+            delay(2000);
+          }
+        }
+
+        // Update login count on LCD
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print("Login Count: ");
+        lcd.print(loginCount);
+
+        // Print fingerprint completion time
+        Serial.println("Fingerprint completion time: " + String(fingerprintEndTime - fingerprintStartTime) + " ms");
+
+        return;
+      } else {
+        String error = "No match found.      Try again";
+        Serial.println(error);
+        displayOnOLED(error);
+        delay(2000);
+        return;
+      }
+    }
+    delay(100);
+  }
+
+  String timeoutMessage = "Timeout, try again.";
+  Serial.println(timeoutMessage);
+  displayOnOLED(timeoutMessage);
+}
+
+int getNextUserID() {
+  HTTPClient http;
+  http.begin(getIDURL);
+  int httpResponseCode = http.GET();
+
+  int userID = -1;
+  if (httpResponseCode > 0) {
+    String response = http.getString();
+    userID = response.toInt(); // Convert the response to an integer
+    Serial.println("Next User ID: " + String(userID));
+  } else {
+    Serial.println("Error sending GET request: " + String(httpResponseCode));
+  }
+
+  http.end();
+  return userID;
+}
+
+String getMatrixNumberByID(int userID) {
+  HTTPClient http;
+  String url = String(matrixURL) + "?id=" + String(userID);
+  http.begin(url);
+  int httpResponseCode = http.GET();
+
+  String matrixNumber = "";
+  if (httpResponseCode > 0) {
+    matrixNumber = http.getString();
+    Serial.print("Matrix Number for ID " + String(userID) + ": ");
+    Serial.println(matrixNumber);
+  } else {
+    Serial.print("Error sending GET request: ");
+    Serial.println(httpResponseCode);
+  }
+
+  http.end();
+  return matrixNumber;
+}
+
+void sendLoginLogoutRequest(int userID, String action) {
+  HTTPClient http;
+
+  // Define your PHP server URL here
+  String url = "http://192.168.73.157/login_logout.php";  // Change to your server's IP or domain
+  String matrixNum = getMatrixNumberByID(userID); // Assuming you fetch matrix number with the ID
+
+  if (matrixNum != "") {
+    http.begin(url);
+    http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+
+    // Prepare POST data
+    String postData = "action=" + action + "&matrix_num=" + matrixNum;
+
+    // Send the POST request
+    int httpResponseCode = http.POST(postData);
+
+    if (httpResponseCode > 0) {
+      String response = http.getString();
+      Serial.println("Server Response: " + response);
+    } else {
+      Serial.println("Error sending POST request: " + String(httpResponseCode));
+    }
+
+    http.end();
+  } else {
+    Serial.println("Error: Matrix number not found.");
+  }
+}
+
+bool getUserInput(String &input, const char *prompt) {
+  Serial.println(prompt);
+  unsigned long startTime = millis();
+  while (millis() - startTime < 30000) {
+    if (Serial.available() > 0) {
+      input = Serial.readStringUntil('\n');
+      input.trim();
+      if (input.length() > 0) return true;
+    }
+    delay(100);
+  }
+  input = "";
+  return true;
+}
